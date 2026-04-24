@@ -1,6 +1,9 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import dns from "node:dns";
+
+dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -42,24 +45,42 @@ function toGeminiContents(messages) {
 }
 
 async function chatWithGemini({ systemPrompt, messages }) {
-  const response = await fetch(
-    `${geminiBaseUrl}/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent?key=${encodeURIComponent(geminiApiKey)}`,
-    {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: systemPrompt }]
-      },
-      contents: toGeminiContents(messages),
-      generationConfig: {
-        temperature: 0.7,
-        topP: 0.9,
-        maxOutputTokens: 600
+  const url = `${geminiBaseUrl}/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent?key=${encodeURIComponent(geminiApiKey)}`;
+
+  let response;
+  let lastError;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemPrompt }]
+          },
+          contents: toGeminiContents(messages),
+          generationConfig: {
+            temperature: 0.7,
+            topP: 0.9,
+            maxOutputTokens: 600
+          }
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 3) {
+        throw new Error(`Network error while calling Gemini: ${error.message}`);
       }
-    })
     }
-  );
+  }
+
+  if (!response) {
+    throw new Error(`Network error while calling Gemini: ${lastError?.message || "Unknown error"}`);
+  }
 
   if (!response.ok) {
     const text = await response.text();
