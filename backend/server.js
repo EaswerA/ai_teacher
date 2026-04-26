@@ -1,22 +1,31 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import dns from "node:dns";
-
-dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-const geminiApiKey = process.env.GEMINI_API_KEY;
-const geminiModel = process.env.GEMINI_MODEL || "gemini-2.0-flash";
-const geminiBaseUrl = process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
+const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+
+const configuredModelList = (process.env.OLLAMA_MODELS || "")
+  .split(",")
+  .map((model) => model.trim())
+  .filter(Boolean);
+
+const fallbackModelList = [process.env.OLLAMA_MODEL || "llama3.2:1b", "qwen2.5:1.5b", "phi3:mini"];
+const ollamaModels = [...new Set((configuredModelList.length > 0 ? configuredModelList : fallbackModelList).filter(Boolean))];
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, model: geminiModel, provider: "gemini", apiKeyConfigured: Boolean(geminiApiKey) });
+  res.json({
+    ok: true,
+    provider: "ollama",
+    model: ollamaModels[0],
+    models: ollamaModels,
+    baseUrl: ollamaBaseUrl
+  });
 });
 
 function buildSystemPrompt({ subject, level, mode }) {
@@ -35,17 +44,13 @@ function buildSystemPrompt({ subject, level, mode }) {
   ].join("\n");
 }
 
-function toGeminiContents(messages) {
-  return messages
-    .filter((msg) => (msg.role === "user" || msg.role === "assistant") && typeof msg.content === "string")
-    .map((msg) => ({
-      role: msg.role === "assistant" ? "model" : "user",
-      parts: [{ text: msg.content }]
-    }));
+function shouldTryNextModel(error) {
+  const message = String(error?.message || "");
+  return /not found|model|404|500|502|503|504|network|timeout/i.test(message);
 }
 
-async function chatWithGemini({ systemPrompt, messages }) {
-  const url = `${geminiBaseUrl}/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent?key=${encodeURIComponent(geminiApiKey)}`;
+async function chatWithOllamaModel({ model, systemPrompt, messages }) {
+  const url = `${ollamaBaseUrl}/api/chat`;
 
   let response;
   let lastError;
@@ -56,40 +61,59 @@ async function chatWithGemini({ systemPrompt, messages }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: systemPrompt }]
-          },
-          contents: toGeminiContents(messages),
-          generationConfig: {
+          model,
+          messages: [{ role: "system", content: systemPrompt }, ...messages],
+          stream: false,
+          options: {
             temperature: 0.7,
-            topP: 0.9,
-            maxOutputTokens: 600
+            top_p: 0.9
           }
-        }),
-        signal: AbortSignal.timeout(15000)
+        })
       });
 
       break;
     } catch (error) {
       lastError = error;
       if (attempt === 3) {
-        throw new Error(`Network error while calling Gemini: ${error.message}`);
+        throw new Error(`Network error while calling Ollama model ${model}: ${error.message}`);
       }
     }
   }
 
   if (!response) {
-    throw new Error(`Network error while calling Gemini: ${lastError?.message || "Unknown error"}`);
+    const networkError = new Error(`Network error while calling Ollama model ${model}: ${lastError?.message || "Unknown error"}`);
+    networkError.model = model;
+    throw networkError;
   }
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(
-      `Gemini error ${response.status}: ${text}. If this is a NOT_FOUND model error, set GEMINI_MODEL in backend/.env to an available model such as gemini-2.0-flash.`
-    );
+    const httpError = new Error(`Ollama error ${response.status} for model ${model}: ${text}`);
+    httpError.status = response.status;
+    httpError.model = model;
+    throw httpError;
   }
 
   return response.json();
+}
+
+async function chatWithOllama({ systemPrompt, messages }) {
+  const errors = [];
+
+  for (const model of ollamaModels) {
+    try {
+      const data = await chatWithOllamaModel({ model, systemPrompt, messages });
+      return { data, modelUsed: model };
+    } catch (error) {
+      errors.push(error?.message || `Unknown error for model ${model}`);
+
+      if (!shouldTryNextModel(error)) {
+        break;
+      }
+    }
+  }
+
+  throw new Error(`All configured Ollama models failed. ${errors.join(" | ")}`);
 }
 
 app.post("/api/chat", async (req, res) => {
@@ -107,26 +131,19 @@ app.post("/api/chat", async (req, res) => {
   ];
 
   try {
-    if (!geminiApiKey) {
-      return res.status(500).json({
-        error: "GEMINI_API_KEY is missing. Add it to backend/.env and restart the backend."
-      });
-    }
-
-    const data = await chatWithGemini({ systemPrompt, messages });
+    const { data, modelUsed } = await chatWithOllama({ systemPrompt, messages });
 
     const reply =
-      data?.candidates?.[0]?.content?.parts
-        ?.map((part) => part?.text || "")
-        .join("\n")
-        .trim() || "I could not generate a response.";
+      data?.message?.content?.trim() ||
+      data?.response?.trim() ||
+      "I could not generate a response.";
 
-    return res.json({ reply });
+    return res.json({ reply, model: modelUsed });
   } catch (error) {
     console.error(error);
 
     return res.status(502).json({
-      error: "Could not reach Gemini. Check your API key and internet connection.",
+      error: "Could not reach local Ollama. Make sure Ollama is running and at least one configured model is pulled.",
       details: error.message
     });
   }
